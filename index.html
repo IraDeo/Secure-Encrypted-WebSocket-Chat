@@ -1,0 +1,284 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8" />
+    <title>Secure Chat Frontend</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            /* Background image placeholder - replace URL below */
+            background-image: url('background.jpg');
+            background-size: cover;
+            background-position: center;
+            background-repeat: no-repeat;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .card {
+            width: 880px;
+            max-width: 95%;
+            background: rgba(255,255,255,0.95);
+            border-radius: 12px;
+            box-shadow: 0 8px 30px rgba(0,0,0,0.15);
+            padding: 18px;
+        }
+        .header { display:flex; gap:12px; align-items:center; margin-bottom:8px; }
+        .log { height: 340px; overflow:auto; border:1px solid #eee; padding:10px; background:#fff; border-radius:8px; }
+        .controls { display:flex; gap:8px; margin-top:8px; }
+        input[type="text"] { flex:1; padding:8px; border-radius:6px; border:1px solid #ddd; }
+        button { padding:8px 12px; border-radius:6px; border:none; background:#0b74de; color:#fff; cursor:pointer; }
+        .small { font-size:13px; color:#666; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <div class="header">
+            <div style="flex:1">
+                <h3 style="margin:0">Secure Chat Frontend</h3>
+                <div class="small">Connects to WebSocket server at <code>ws://localhost:8765</code></div>
+            </div>
+            <div>
+                <input id="keyInput" placeholder="Paste AES key hex here" style="width:320px;padding:6px;border-radius:6px;border:1px solid #ddd" />
+            </div>
+        </div>
+
+        <div class="log" id="log"></div>
+
+        <div style="margin-top:8px">
+            <div class="controls">
+                <input id="msgInput" type="text" placeholder="Type message..." />
+                <button id="sendBtn">Send</button>
+                <input id="fileInput" type="file" />
+                <button id="sendFileBtn">Send File</button>
+                <button id="pingBtn">Ping</button>
+            </div>
+            <div class="small" style="margin-top:6px">Latency: <span id="latency">-</span> ms</div>
+        </div>
+    </div>
+
+<script>
+const logElem = document.getElementById('log');
+const keyInput = document.getElementById('keyInput');
+const msgInput = document.getElementById('msgInput');
+const sendBtn = document.getElementById('sendBtn');
+const fileInput = document.getElementById('fileInput');
+const sendFileBtn = document.getElementById('sendFileBtn');
+const pingBtn = document.getElementById('pingBtn');
+const latencySpan = document.getElementById('latency');
+
+let ws;
+let cryptoKey; // CryptoKey for SubtleCrypto
+let rawKeyHex;
+let isConnecting = false; // Add state to prevent rapid connect attempts
+
+// Utility
+function appendLog(txt) {
+    const p = document.createElement('div'); p.innerText = txt;
+    logElem.appendChild(p); logElem.scrollTop = logElem.scrollHeight;
+}
+
+// convert hex -> ArrayBuffer
+function hexToBuffer(hex) {
+    const bytes = new Uint8Array(hex.length/2);
+    for (let i=0;i<bytes.length;i++) bytes[i] = parseInt(hex.substr(i*2,2),16);
+    return bytes.buffer;
+}
+
+// import key from hex string
+async function importKeyFromHex(hex) {
+    rawKeyHex = hex;
+    const buf = hexToBuffer(hex);
+    cryptoKey = await window.crypto.subtle.importKey('raw', buf, { name:'AES-GCM' }, false, ['encrypt','decrypt']);
+    appendLog('Key imported (browser).');
+}
+
+// encrypt plaintext Uint8Array -> returns ArrayBuffer nonce+ct
+async function encryptPlain(plainUint8) {
+    const nonce = window.crypto.getRandomValues(new Uint8Array(12));
+    const ct = await window.crypto.subtle.encrypt({ name:'AES-GCM', iv: nonce }, cryptoKey, plainUint8);
+    // concat nonce + ct
+    const out = new Uint8Array(12 + ct.byteLength);
+    out.set(nonce, 0);
+    out.set(new Uint8Array(ct), 12);
+    return out.buffer;
+}
+
+// decrypt buffer containing nonce+ct -> Uint8Array plaintext
+async function decryptBuffer(buf) {
+    const u = new Uint8Array(buf);
+    const nonce = u.slice(0,12);
+    const ct = u.slice(12);
+    const pt = await window.crypto.subtle.decrypt({ name:'AES-GCM', iv: nonce }, cryptoKey, ct);
+    return new Uint8Array(pt);
+}
+
+// build framed payload (4-byte len + nonce+ct)
+function buildFramed(buf) {
+    const u = new Uint8Array(buf);
+    const header = new Uint8Array(4);
+    const len = u.length;
+    // Helper function to pack a 32-bit integer into 4 bytes (Big Endian)
+    header[0] = (len >>> 24) & 0xFF;
+    header[1] = (len >>> 16) & 0xFF;
+    header[2] = (len >>> 8) & 0xFF;
+    header[3] = (len) & 0xFF;
+    const out = new Uint8Array(4 + len);
+    out.set(header, 0);
+    out.set(u, 4);
+    return out.buffer;
+}
+
+// connect WS
+function connectWS() {
+    if (isConnecting || (ws && ws.readyState === 1)) return; // Prevent double connect
+    isConnecting = true;
+    
+    ws = new WebSocket('ws://localhost:8765');
+    ws.binaryType = 'arraybuffer';
+    
+    ws.onopen = () => {
+        appendLog('[WS] Connected to server.');
+        isConnecting = false;
+    };
+    
+    ws.onmessage = async (ev) => {
+        const buf = ev.data;
+        try {
+            // buffer may be framed (4 bytes) + nonce+ct as server sends; decrypt directly
+            let arr = new Uint8Array(buf);
+            if (arr.length >= 4) {
+                const maybeLen = (arr[0]<<24)|(arr[1]<<16)|(arr[2]<<8)|arr[3];
+                if (maybeLen === arr.length - 4) {
+                    arr = arr.slice(4);
+                }
+            }
+            const pt = await decryptBuffer(arr.buffer);
+            const txt = new TextDecoder().decode(pt);
+            appendLog('[SERVER] ' + txt);
+            // if it is JSON ack with ts, update latency
+            try {
+                const j = JSON.parse(txt);
+                if (j.ts) {
+                    const rtt = (Date.now()/1000 - j.ts)*1000;
+                    latencySpan.innerText = rtt.toFixed(1);
+                }
+            } catch(e){}
+        } catch (e) {
+            appendLog('[WS] Decrypt error: ' + e);
+        }
+    };
+    
+    ws.onclose = () => {
+        appendLog('[WS] Disconnected.');
+        isConnecting = false; // Allow reconnection attempt after disconnect
+    };
+    
+    ws.onerror = (e) => {
+        appendLog('[WS] Error');
+        isConnecting = false;
+    };
+}
+
+// --- Event Handlers ---
+
+async function ensureConnectionAndSend(payload, logMessage) {
+    if (!cryptoKey) { alert('Paste key hex and press Enter to import it first.'); return false; }
+    
+    if (!ws || ws.readyState !== 1) {
+        // Only attempt to connect/reconnect once per send button click.
+        // The original code was recursively calling the handler with setTimeout, 
+        // which caused the infinite loop if the connection failed.
+        if (ws && ws.readyState === 0) {
+            appendLog('[WS] Connection attempt in progress, please wait...');
+            return false;
+        }
+        
+        appendLog('[WS] Attempting to connect...');
+        connectWS();
+        
+        // Use a Promise/setTimeout to wait for connection success (or fail)
+        await new Promise(resolve => {
+            const checkInterval = setInterval(() => {
+                if (ws.readyState === 1) {
+                    clearInterval(checkInterval);
+                    resolve(true);
+                } else if (ws.readyState === 3) {
+                    clearInterval(checkInterval);
+                    resolve(false);
+                }
+            }, 100);
+            // Timeout if connection takes too long
+            setTimeout(() => { clearInterval(checkInterval); resolve(false); }, 2000); 
+        });
+
+        if (ws.readyState !== 1) {
+            appendLog('[WS] Connection failed or still establishing. Try again.');
+            return false;
+        }
+    }
+    
+    try {
+        const enc = await encryptPlain(new TextEncoder().encode(payload));
+        ws.send(buildFramed(enc));
+        if (logMessage) appendLog(logMessage);
+        return true;
+    } catch (e) {
+        appendLog(`[ERROR] Failed to encrypt/send: ${e}`);
+        return false;
+    }
+}
+
+sendBtn.onclick = async () => {
+    const text = msgInput.value;
+    if (!text) return;
+    const payload = JSON.stringify({ type:'msg', text, ts: Date.now()/1000 });
+    const success = await ensureConnectionAndSend(payload, '[YOU] ' + text);
+    if (success) msgInput.value = '';
+};
+
+fileInput.onchange = () => {};
+
+sendFileBtn.onclick = async () => {
+    const f = fileInput.files[0];
+    if (!f) { alert('Pick a file'); return; }
+    
+    const fileData = await f.arrayBuffer();
+    // Use Uint8Array.reduce to create the binary string for btoa, which handles large files better than String.fromCharCode(...arr)
+    const arr = new Uint8Array(fileData);
+    const binaryString = arr.reduce((acc, byte) => acc + String.fromCharCode(byte), '');
+    const b64 = btoa(binaryString);
+
+    const payload = JSON.stringify({ type:'file', filename: f.name, data_b64: b64, ts: Date.now()/1000 });
+    const logMessage = `[YOU] Sent file: ${f.name} (${arr.length} bytes)`;
+    await ensureConnectionAndSend(payload, logMessage);
+};
+
+pingBtn.onclick = async () => {
+    const payload = JSON.stringify({ type:'ping', ts: Date.now()/1000 });
+    await ensureConnectionAndSend(payload, null); // Don't log ping until pong is received
+};
+
+// This is the ONLY place where connectWS is explicitly called without a user-triggered send event
+keyInput.addEventListener('keypress', async (e) => {
+    if (e.key === 'Enter') {
+        const hex = keyInput.value.trim();
+        if (!hex) return;
+        try {
+            await importKeyFromHex(hex);
+            // connect after importing key
+            connectWS();
+        } catch (err) {
+            appendLog('Invalid key hex or key import failed.');
+        }
+    }
+});
+
+// Helpful hint
+appendLog('Paste the server AES key hex into the input above and press Enter to import it. This will connect to the server.');
+</script>
+</body>
+</html>
